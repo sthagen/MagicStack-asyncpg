@@ -15,9 +15,14 @@ static PyObject * record_new_items_iter(PyObject *);
 static ApgRecordObject *free_list[ApgRecord_MAXSAVESIZE];
 static int numfree[ApgRecord_MAXSAVESIZE];
 
+static size_t MAX_RECORD_SIZE = (
+    ((size_t)PY_SSIZE_T_MAX - sizeof(ApgRecordObject) - sizeof(PyObject *))
+    / sizeof(PyObject *)
+);
+
 
 PyObject *
-ApgRecord_New(PyObject *desc, Py_ssize_t size)
+ApgRecord_New(PyTypeObject *type, PyObject *desc, Py_ssize_t size)
 {
     ApgRecordObject *o;
     Py_ssize_t i;
@@ -27,19 +32,36 @@ ApgRecord_New(PyObject *desc, Py_ssize_t size)
         return NULL;
     }
 
-    if (size < ApgRecord_MAXSAVESIZE && (o = free_list[size]) != NULL) {
-        free_list[size] = (ApgRecordObject *) o->ob_item[0];
-        numfree[size]--;
-        _Py_NewReference((PyObject *)o);
-    }
-    else {
-        /* Check for overflow */
-        if ((size_t)size > ((size_t)PY_SSIZE_T_MAX - sizeof(ApgRecordObject) -
-                    sizeof(PyObject *)) / sizeof(PyObject *)) {
+    if (type == &ApgRecord_Type) {
+        if (size < ApgRecord_MAXSAVESIZE && (o = free_list[size]) != NULL) {
+            free_list[size] = (ApgRecordObject *) o->ob_item[0];
+            numfree[size]--;
+            _Py_NewReference((PyObject *)o);
+        }
+        else {
+            /* Check for overflow */
+            if ((size_t)size > MAX_RECORD_SIZE) {
+                return PyErr_NoMemory();
+            }
+            o = PyObject_GC_NewVar(ApgRecordObject, &ApgRecord_Type, size);
+            if (o == NULL) {
+                return NULL;
+            }
+        }
+
+        PyObject_GC_Track(o);
+    } else {
+        assert(PyType_IsSubtype(type, &ApgRecord_Type));
+
+        if ((size_t)size > MAX_RECORD_SIZE) {
             return PyErr_NoMemory();
         }
-        o = PyObject_GC_NewVar(ApgRecordObject, &ApgRecord_Type, size);
-        if (o == NULL) {
+        o = (ApgRecordObject *)type->tp_alloc(type, size);
+        if (!_PyObject_GC_IS_TRACKED(o)) {
+            PyErr_SetString(
+                PyExc_TypeError,
+                "record subclass is not tracked by GC"
+            );
             return NULL;
         }
     }
@@ -51,7 +73,6 @@ ApgRecord_New(PyObject *desc, Py_ssize_t size)
     Py_INCREF(desc);
     o->desc = (ApgRecordDescObject*)desc;
     o->self_hash = -1;
-    PyObject_GC_Track(o);
     return (PyObject *) o;
 }
 
@@ -132,12 +153,11 @@ record_length(ApgRecordObject *o)
 static Py_hash_t
 record_hash(ApgRecordObject *v)
 {
-    Py_ssize_t i;
     Py_uhash_t acc = _PyHASH_XXPRIME_5;
-    Py_ssize_t len = Py_SIZE(v);
+    size_t i, len = (size_t)Py_SIZE(v);
     PyObject **els = v->ob_item;
     for (i = 0; i < len; i++) {
-        Py_uhash_t lane = PyObject_Hash(els[i]);
+        Py_uhash_t lane = (Py_uhash_t)PyObject_Hash(els[i]);
         if (lane == (Py_uhash_t)-1) {
             return -1;
         }
