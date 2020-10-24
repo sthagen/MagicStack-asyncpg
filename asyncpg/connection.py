@@ -228,7 +228,7 @@ class Connection(metaclass=ConnectionMeta):
         """
         return self._protocol.get_settings()
 
-    def transaction(self, *, isolation='read_committed', readonly=False,
+    def transaction(self, *, isolation=None, readonly=False,
                     deferrable=False):
         """Create a :class:`~transaction.Transaction` object.
 
@@ -237,7 +237,9 @@ class Connection(metaclass=ConnectionMeta):
 
         :param isolation: Transaction isolation mode, can be one of:
                           `'serializable'`, `'repeatable_read'`,
-                          `'read_committed'`.
+                          `'read_committed'`. If not specified, the behavior
+                          is up to the server and session, which is usually
+                          ``read_committed``.
 
         :param readonly: Specifies whether or not this transaction is
                          read-only.
@@ -340,13 +342,16 @@ class Connection(metaclass=ConnectionMeta):
         *,
         named: bool=False,
         use_cache: bool=True,
+        ignore_custom_codec=False,
         record_class=None
     ):
         if record_class is None:
             record_class = self._protocol.get_record_class()
 
         if use_cache:
-            statement = self._stmt_cache.get((query, record_class))
+            statement = self._stmt_cache.get(
+                (query, record_class, ignore_custom_codec)
+            )
             if statement is not None:
                 return statement
 
@@ -369,6 +374,7 @@ class Connection(metaclass=ConnectionMeta):
             query,
             timeout,
             record_class=record_class,
+            ignore_custom_codec=ignore_custom_codec,
         )
         need_reprepare = False
         types_with_missing_codecs = statement._init_types()
@@ -413,7 +419,8 @@ class Connection(metaclass=ConnectionMeta):
             )
 
         if use_cache:
-            self._stmt_cache.put((query, record_class), statement)
+            self._stmt_cache.put(
+                (query, record_class, ignore_custom_codec), statement)
 
         # If we've just created a new statement object, check if there
         # are any statements for GC.
@@ -424,7 +431,40 @@ class Connection(metaclass=ConnectionMeta):
 
     async def _introspect_types(self, typeoids, timeout):
         return await self.__execute(
-            self._intro_query, (list(typeoids),), 0, timeout)
+            self._intro_query,
+            (list(typeoids),),
+            0,
+            timeout,
+            ignore_custom_codec=True,
+        )
+
+    async def _introspect_type(self, typename, schema):
+        if (
+            schema == 'pg_catalog'
+            and typename.lower() in protocol.BUILTIN_TYPE_NAME_MAP
+        ):
+            typeoid = protocol.BUILTIN_TYPE_NAME_MAP[typename.lower()]
+            rows = await self._execute(
+                introspection.TYPE_BY_OID,
+                [typeoid],
+                limit=0,
+                timeout=None,
+                ignore_custom_codec=True,
+            )
+        else:
+            rows = await self._execute(
+                introspection.TYPE_BY_NAME,
+                [typename, schema],
+                limit=1,
+                timeout=None,
+                ignore_custom_codec=True,
+            )
+
+        if not rows:
+            raise ValueError(
+                'unknown type: {}.{}'.format(schema, typename))
+
+        return rows[0]
 
     def cursor(
         self,
@@ -1108,12 +1148,7 @@ class Connection(metaclass=ConnectionMeta):
             ``format``.
         """
         self._check_open()
-
-        typeinfo = await self.fetchrow(
-            introspection.TYPE_BY_NAME, typename, schema)
-        if not typeinfo:
-            raise ValueError('unknown type: {}.{}'.format(schema, typename))
-
+        typeinfo = await self._introspect_type(typename, schema)
         if not introspection.is_scalar_type(typeinfo):
             raise ValueError(
                 'cannot use custom codec on non-scalar type {}.{}'.format(
@@ -1140,15 +1175,9 @@ class Connection(metaclass=ConnectionMeta):
         .. versionadded:: 0.12.0
         """
 
-        typeinfo = await self.fetchrow(
-            introspection.TYPE_BY_NAME, typename, schema)
-        if not typeinfo:
-            raise ValueError('unknown type: {}.{}'.format(schema, typename))
-
-        oid = typeinfo['oid']
-
+        typeinfo = await self._introspect_type(typename, schema)
         self._protocol.get_settings().remove_python_codec(
-            oid, typename, schema)
+            typeinfo['oid'], typename, schema)
 
         # Statement cache is no longer valid due to codec changes.
         self._drop_local_statement_cache()
@@ -1189,13 +1218,7 @@ class Connection(metaclass=ConnectionMeta):
             core data type.  Added the *format* keyword argument.
         """
         self._check_open()
-
-        typeinfo = await self.fetchrow(
-            introspection.TYPE_BY_NAME, typename, schema)
-        if not typeinfo:
-            raise exceptions.InterfaceError(
-                'unknown type: {}.{}'.format(schema, typename))
-
+        typeinfo = await self._introspect_type(typename, schema)
         if not introspection.is_scalar_type(typeinfo):
             raise exceptions.InterfaceError(
                 'cannot alias non-scalar type {}.{}'.format(
@@ -1314,7 +1337,9 @@ class Connection(metaclass=ConnectionMeta):
     def _maybe_gc_stmt(self, stmt):
         if (
             stmt.refs == 0
-            and not self._stmt_cache.has((stmt.query, stmt.record_class))
+            and not self._stmt_cache.has(
+                (stmt.query, stmt.record_class, stmt.ignore_custom_codec)
+            )
         ):
             # If low-level `stmt` isn't referenced from any high-level
             # `PreparedStatement` object and is not in the `_stmt_cache`:
@@ -1578,6 +1603,7 @@ class Connection(metaclass=ConnectionMeta):
         timeout,
         *,
         return_status=False,
+        ignore_custom_codec=False,
         record_class=None
     ):
         with self._stmt_exclusive_section:
@@ -1588,6 +1614,7 @@ class Connection(metaclass=ConnectionMeta):
                 timeout,
                 return_status=return_status,
                 record_class=record_class,
+                ignore_custom_codec=ignore_custom_codec,
             )
         return result
 
@@ -1599,6 +1626,7 @@ class Connection(metaclass=ConnectionMeta):
         timeout,
         *,
         return_status=False,
+        ignore_custom_codec=False,
         record_class=None
     ):
         executor = lambda stmt, timeout: self._protocol.bind_execute(
@@ -1609,6 +1637,7 @@ class Connection(metaclass=ConnectionMeta):
             executor,
             timeout,
             record_class=record_class,
+            ignore_custom_codec=ignore_custom_codec,
         )
 
     async def _executemany(self, query, args, timeout):
@@ -1626,6 +1655,7 @@ class Connection(metaclass=ConnectionMeta):
         timeout,
         retry=True,
         *,
+        ignore_custom_codec=False,
         record_class=None
     ):
         if timeout is None:
@@ -1633,6 +1663,7 @@ class Connection(metaclass=ConnectionMeta):
                 query,
                 None,
                 record_class=record_class,
+                ignore_custom_codec=ignore_custom_codec,
             )
         else:
             before = time.monotonic()
@@ -1640,6 +1671,7 @@ class Connection(metaclass=ConnectionMeta):
                 query,
                 timeout,
                 record_class=record_class,
+                ignore_custom_codec=ignore_custom_codec,
             )
             after = time.monotonic()
             timeout -= after - before
