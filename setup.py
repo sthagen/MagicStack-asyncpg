@@ -25,7 +25,7 @@ from setuptools.command import sdist as setuptools_sdist
 from setuptools.command import build_ext as setuptools_build_ext
 
 
-CYTHON_DEPENDENCY = 'Cython==0.29.20'
+CYTHON_DEPENDENCY = 'Cython(>=0.29.20,<0.30.0)'
 
 # Minimal dependencies required to test asyncpg.
 TEST_DEPENDENCIES = [
@@ -69,7 +69,7 @@ with open(str(_ROOT / 'README.rst')) as f:
     readme = f.read()
 
 
-with open(str(_ROOT / 'asyncpg' / '__init__.py')) as f:
+with open(str(_ROOT / 'asyncpg' / '_version.py')) as f:
     for line in f:
         if line.startswith('__version__ ='):
             _, _, version = line.partition('=')
@@ -77,7 +77,7 @@ with open(str(_ROOT / 'asyncpg' / '__init__.py')) as f:
             break
     else:
         raise RuntimeError(
-            'unable to read the version from asyncpg/__init__.py')
+            'unable to read the version from asyncpg/_version.py')
 
 
 if (_ROOT / '.git').is_dir() and 'dev' in VERSION:
@@ -122,7 +122,7 @@ class sdist(setuptools_sdist.sdist, VersionMixin):
 
     def make_release_tree(self, base_dir, files):
         super().make_release_tree(base_dir, files)
-        self._fix_version(pathlib.Path(base_dir) / 'asyncpg' / '__init__.py')
+        self._fix_version(pathlib.Path(base_dir) / 'asyncpg' / '_version.py')
 
 
 class build_py(setuptools_build_py.build_py, VersionMixin):
@@ -263,6 +263,7 @@ setuptools.setup(
         'Programming Language :: Python :: 3.6',
         'Programming Language :: Python :: 3.7',
         'Programming Language :: Python :: 3.8',
+        'Programming Language :: Python :: 3.9',
         'Programming Language :: Python :: Implementation :: CPython',
         'Topic :: Database :: Front-Ends',
     ],
@@ -291,6 +292,7 @@ setuptools.setup(
             extra_compile_args=CFLAGS,
             extra_link_args=LDFLAGS),
     ],
+    install_requires=['typing-extensions>=3.7.4.3;python_version<"3.8"'],
     cmdclass={'build_ext': build_ext, 'build_py': build_py, 'sdist': sdist},
     test_suite='tests.suite',
     extras_require=EXTRA_DEPENDENCIES,

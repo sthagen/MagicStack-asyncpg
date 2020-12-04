@@ -331,6 +331,13 @@ class Connection(metaclass=ConnectionMeta):
 
         .. versionchanged:: 0.11.0
            `timeout` became a keyword-only parameter.
+
+        .. versionchanged:: 0.22.0
+           The execution was changed to be in an implicit transaction if there
+           was no explicit transaction, so that it will no longer end up with
+           partial success. If you still need the previous behavior to
+           progressively execute many args, please use a loop with prepared
+           statement instead.
         """
         self._check_open()
         return await self._executemany(command, args, timeout)
@@ -1010,6 +1017,9 @@ class Connection(metaclass=ConnectionMeta):
             f = source
         elif isinstance(source, collections.abc.AsyncIterable):
             # assuming calling output returns an awaitable.
+            # copy_in() is designed to handle very large amounts of data, and
+            # the source async iterable is allowed to return an arbitrary
+            # amount of data on every iteration.
             reader = source
         else:
             # assuming source is an instance supporting the buffer protocol.
@@ -1146,13 +1156,31 @@ class Connection(metaclass=ConnectionMeta):
         .. versionchanged:: 0.13.0
             The ``binary`` keyword argument was removed in favor of
             ``format``.
+
+        .. note::
+
+           It is recommended to use the ``'binary'`` or ``'tuple'`` *format*
+           whenever possible and if the underlying type supports it. Asyncpg
+           currently does not support text I/O for composite and range types,
+           and some other functionality, such as
+           :meth:`Connection.copy_to_table`, does not support types with text
+           codecs.
         """
         self._check_open()
         typeinfo = await self._introspect_type(typename, schema)
         if not introspection.is_scalar_type(typeinfo):
-            raise ValueError(
+            raise exceptions.InterfaceError(
                 'cannot use custom codec on non-scalar type {}.{}'.format(
                     schema, typename))
+        if introspection.is_domain_type(typeinfo):
+            raise exceptions.UnsupportedClientFeatureError(
+                'custom codecs on domain types are not supported',
+                hint='Set the codec on the base type.',
+                detail=(
+                    'PostgreSQL does not distinguish domains from '
+                    'their base types in query results at the protocol level.'
+                )
+            )
 
         oid = typeinfo['oid']
         self._protocol.get_settings().add_python_codec(
@@ -1763,6 +1791,11 @@ async def connect(dsn=None, *,
         Unlike libpq, asyncpg will treat unrecognized options
         as `server settings`_ to be used for the connection.
 
+        .. note::
+
+           The URI must be *valid*, which means that all components must
+           be properly quoted with :py:func:`urllib.parse.quote`.
+
     :param host:
         Database host address as one of the following:
 
@@ -1854,7 +1887,28 @@ async def connect(dsn=None, *,
         Pass ``True`` or an `ssl.SSLContext <SSLContext_>`_ instance to
         require an SSL connection.  If ``True``, a default SSL context
         returned by `ssl.create_default_context() <create_default_context_>`_
-        will be used.
+        will be used.  The value can also be one of the following strings:
+
+        - ``'disable'`` - SSL is disabled (equivalent to ``False``)
+        - ``'prefer'`` - try SSL first, fallback to non-SSL connection
+          if SSL connection fails
+        - ``'allow'`` - currently equivalent to ``'prefer'``
+        - ``'require'`` - only try an SSL connection.  Certificate
+          verifiction errors are ignored
+        - ``'verify-ca'`` - only try an SSL connection, and verify
+          that the server certificate is issued by a trusted certificate
+          authority (CA)
+        - ``'verify-full'`` - only try an SSL connection, verify
+          that the server certificate is issued by a trusted CA and
+          that the requested server host name matches that in the
+          certificate.
+
+        The default is ``'prefer'``: try an SSL connection and fallback to
+        non-SSL connection if that fails.
+
+        .. note::
+
+           *ssl* is ignored for Unix domain socket communication.
 
     :param dict server_settings:
         An optional dict of server runtime parameters.  Refer to
@@ -1911,6 +1965,9 @@ async def connect(dsn=None, *,
     .. versionchanged:: 0.22.0
        Added the *record_class* parameter.
 
+    .. versionchanged:: 0.22.0
+       The *ssl* argument now defaults to ``'prefer'``.
+
     .. _SSLContext: https://docs.python.org/3/library/ssl.html#ssl.SSLContext
     .. _create_default_context:
         https://docs.python.org/3/library/ssl.html#ssl.create_default_context
@@ -1919,7 +1976,7 @@ async def connect(dsn=None, *,
     .. _postgres envvars:
         https://www.postgresql.org/docs/current/static/libpq-envars.html
     .. _libpq connection URI format:
-        https://www.postgresql.org/docs/current/static/\
+        https://www.postgresql.org/docs/current/static/
         libpq-connect.html#LIBPQ-CONNSTRING
     """
     if not issubclass(connection_class, Connection):
