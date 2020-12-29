@@ -321,23 +321,17 @@ class Connection(metaclass=ConnectionMeta):
         :param float timeout: Optional timeout value in seconds.
         :return None: This method discards the results of the operations.
 
-        .. note::
-
-           When inserting a large number of rows,
-           use :meth:`Connection.copy_records_to_table()` instead,
-           it is much more efficient for this purpose.
-
         .. versionadded:: 0.7.0
 
         .. versionchanged:: 0.11.0
            `timeout` became a keyword-only parameter.
 
         .. versionchanged:: 0.22.0
-           The execution was changed to be in an implicit transaction if there
-           was no explicit transaction, so that it will no longer end up with
-           partial success. If you still need the previous behavior to
-           progressively execute many args, please use a loop with prepared
-           statement instead.
+           ``executemany()`` is now an atomic operation, which means that
+           either all executions succeed, or none at all.  This is in contrast
+           to prior versions, where the effect of already-processed iterations
+           would remain in place when an error has occurred, unless
+           ``executemany()`` was called in a transaction.
         """
         self._check_open()
         return await self._executemany(command, args, timeout)
@@ -354,6 +348,8 @@ class Connection(metaclass=ConnectionMeta):
     ):
         if record_class is None:
             record_class = self._protocol.get_record_class()
+        else:
+            _check_record_class(record_class)
 
         if use_cache:
             statement = self._stmt_cache.get(
@@ -1980,14 +1976,12 @@ async def connect(dsn=None, *,
         libpq-connect.html#LIBPQ-CONNSTRING
     """
     if not issubclass(connection_class, Connection):
-        raise TypeError(
+        raise exceptions.InterfaceError(
             'connection_class is expected to be a subclass of '
             'asyncpg.Connection, got {!r}'.format(connection_class))
 
-    if not issubclass(record_class, protocol.Record):
-        raise TypeError(
-            'record_class is expected to be a subclass of '
-            'asyncpg.Record, got {!r}'.format(record_class))
+    if record_class is not protocol.Record:
+        _check_record_class(record_class)
 
     if loop is None:
         loop = asyncio.get_event_loop()
@@ -2251,6 +2245,27 @@ def _extract_stack(limit=10):
 
     stack.reverse()
     return ''.join(traceback.format_list(stack))
+
+
+def _check_record_class(record_class):
+    if record_class is protocol.Record:
+        pass
+    elif (
+        isinstance(record_class, type)
+        and issubclass(record_class, protocol.Record)
+    ):
+        if (
+            record_class.__new__ is not object.__new__
+            or record_class.__init__ is not object.__init__
+        ):
+            raise exceptions.InterfaceError(
+                'record_class must not redefine __new__ or __init__'
+            )
+    else:
+        raise exceptions.InterfaceError(
+            'record_class is expected to be a subclass of '
+            'asyncpg.Record, got {!r}'.format(record_class)
+        )
 
 
 _uid = 0
