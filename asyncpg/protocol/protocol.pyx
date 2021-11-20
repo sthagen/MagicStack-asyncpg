@@ -38,7 +38,7 @@ from asyncpg.protocol cimport record
 
 from libc.stdint cimport int8_t, uint8_t, int16_t, uint16_t, \
                          int32_t, uint32_t, int64_t, uint64_t, \
-                         UINT32_MAX
+                         INT32_MAX, UINT32_MAX
 
 from asyncpg.exceptions import _base as apg_exc_base
 from asyncpg import compat
@@ -217,7 +217,7 @@ cdef class BaseProtocol(CoreProtocol):
         # Make sure the argument sequence is encoded lazily with
         # this generator expression to keep the memory pressure under
         # control.
-        data_gen = (state._encode_bind_msg(b) for b in args)
+        data_gen = (state._encode_bind_msg(b, i) for i, b in enumerate(args))
         arg_bufs = iter(data_gen)
 
         waiter = self._new_waiter(timeout)
