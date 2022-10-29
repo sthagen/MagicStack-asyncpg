@@ -37,7 +37,7 @@ jobs:
         mkdir -p dist/
         echo "${VERSION}" > dist/VERSION
 
-    - uses: actions/upload-artifact@v2
+    - uses: actions/upload-artifact@v3
       with:
         name: dist
         path: dist/
@@ -50,20 +50,22 @@ jobs:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
       with:
         fetch-depth: 50
         submodules: true
 
     - name: Set up Python
       uses: actions/setup-python@v4
+      with:
+        python-version: "3.x"
 
     - name: Build source distribution
       run: |
         pip install -U setuptools wheel pip
         python setup.py sdist
 
-    - uses: actions/upload-artifact@v2
+    - uses: actions/upload-artifact@v3
       with:
         name: dist
         path: dist/*.tar.*
@@ -74,8 +76,10 @@ jobs:
     outputs:
       include: ${{ steps.set-matrix.outputs.include }}
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - uses: actions/setup-python@v4
+        with:
+          python-version: "3.x"
       - run: pip install cibuildwheel==2.10.2
       - id: set-matrix
         run: |
@@ -86,12 +90,11 @@ jobs:
               && cibuildwheel --print-build-identifiers --platform windows --arch x86,AMD64 | grep cp |  jq -Rc '{"only": inputs, "os": "windows-latest"}'
             } | jq -sc
           )
-          echo ::set-output name=include::"$MATRIX_INCLUDE"
+          echo "include=$MATRIX_INCLUDE" >> $GITHUB_OUTPUT
 
   build-wheels:
     needs: build-wheels-matrix
     runs-on: ${{ matrix.os }}
-    continue-on-error: true
     name: Build ${{ matrix.only }}
 
     strategy:
@@ -106,11 +109,11 @@ jobs:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
       with:
         fetch-depth: 50
         submodules: true
-        
+
     - name: Set up QEMU
       if: runner.os == 'Linux'
       uses: docker/setup-qemu-action@v2
@@ -123,7 +126,7 @@ jobs:
         CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
         CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
 
-    - uses: actions/upload-artifact@v2
+    - uses: actions/upload-artifact@v3
       with:
         name: dist
         path: wheelhouse/*.whl
@@ -137,7 +140,7 @@ jobs:
 
     steps:
     - name: Checkout source
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
       with:
         fetch-depth: 5
         submodules: true
@@ -145,7 +148,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: 3.8
+        python-version: "3.x"
 
     - name: Build docs
       run: |
@@ -153,7 +156,7 @@ jobs:
         make htmldocs
 
     - name: Checkout gh-pages
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
       with:
         fetch-depth: 5
         ref: gh-pages
@@ -179,12 +182,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
       with:
         fetch-depth: 5
         submodules: false
 
-    - uses: actions/download-artifact@v2
+    - uses: actions/download-artifact@v3
       with:
         name: dist
         path: dist/
@@ -193,7 +196,7 @@ jobs:
       id: relver
       run: |
         set -e
-        echo ::set-output name=version::$(cat dist/VERSION)
+        echo "version=$(cat dist/VERSION)" >> $GITHUB_OUTPUT
         rm dist/VERSION
 
     - name: Merge and tag the PR
@@ -219,7 +222,7 @@ jobs:
         ls -al dist/
 
     - name: Upload to PyPI
-      uses: pypa/gh-action-pypi-publish@master
+      uses: pypa/gh-action-pypi-publish@release/v1
       with:
         user: __token__
         password: ${{ secrets.PYPI_TOKEN }}
