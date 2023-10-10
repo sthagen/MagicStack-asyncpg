@@ -9,6 +9,7 @@ import asyncio
 import asyncpg
 import collections
 import collections.abc
+import contextlib
 import functools
 import itertools
 import inspect
@@ -20,6 +21,7 @@ import typing
 import warnings
 import weakref
 
+from . import compat
 from . import connect_utils
 from . import cursor
 from . import exceptions
@@ -52,7 +54,7 @@ class Connection(metaclass=ConnectionMeta):
                  '_intro_query', '_reset_query', '_proxy',
                  '_stmt_exclusive_section', '_config', '_params', '_addr',
                  '_log_listeners', '_termination_listeners', '_cancellations',
-                 '_source_traceback', '__weakref__')
+                 '_source_traceback', '_query_loggers', '__weakref__')
 
     def __init__(self, protocol, transport, loop,
                  addr,
@@ -86,6 +88,7 @@ class Connection(metaclass=ConnectionMeta):
         self._log_listeners = set()
         self._cancellations = set()
         self._termination_listeners = set()
+        self._query_loggers = set()
 
         settings = self._protocol.get_settings()
         ver_string = settings.server_version
@@ -223,6 +226,30 @@ class Connection(metaclass=ConnectionMeta):
         """
         self._termination_listeners.discard(_Callback.from_callable(callback))
 
+    def add_query_logger(self, callback):
+        """Add a logger that will be called when queries are executed.
+
+        :param callable callback:
+            A callable or a coroutine function receiving one argument:
+            **record**: a LoggedQuery containing `query`, `args`, `timeout`,
+                        `elapsed`, `exception`, `conn_addr`, and
+                        `conn_params`.
+
+        .. versionadded:: 0.29.0
+        """
+        self._query_loggers.add(_Callback.from_callable(callback))
+
+    def remove_query_logger(self, callback):
+        """Remove a query logger callback.
+
+        :param callable callback:
+            The callable or coroutine function that was passed to
+            :meth:`Connection.add_query_logger`.
+
+        .. versionadded:: 0.29.0
+        """
+        self._query_loggers.discard(_Callback.from_callable(callback))
+
     def get_server_pid(self):
         """Return the PID of the Postgres server the connection is bound to."""
         return self._protocol.get_server_pid()
@@ -316,7 +343,12 @@ class Connection(metaclass=ConnectionMeta):
         self._check_open()
 
         if not args:
-            return await self._protocol.query(query, timeout)
+            if self._query_loggers:
+                with self._time_and_log(query, args, timeout):
+                    result = await self._protocol.query(query, timeout)
+            else:
+                result = await self._protocol.query(query, timeout)
+            return result
 
         _, status, _ = await self._execute(
             query,
@@ -865,7 +897,7 @@ class Connection(metaclass=ConnectionMeta):
                             delimiter=None, null=None, header=None,
                             quote=None, escape=None, force_quote=None,
                             force_not_null=None, force_null=None,
-                            encoding=None):
+                            encoding=None, where=None):
         """Copy data to the specified table.
 
         :param str table_name:
@@ -883,6 +915,15 @@ class Connection(metaclass=ConnectionMeta):
 
         :param str schema_name:
             An optional schema name to qualify the table.
+
+        :param str where:
+            An optional SQL expression used to filter rows when copying.
+
+            .. note::
+
+                Usage of this parameter requires support for the
+                ``COPY FROM ... WHERE`` syntax, introduced in
+                PostgreSQL version 12.
 
         :param float timeout:
             Optional timeout value in seconds.
@@ -911,6 +952,9 @@ class Connection(metaclass=ConnectionMeta):
             https://www.postgresql.org/docs/current/static/sql-copy.html
 
         .. versionadded:: 0.11.0
+
+        .. versionadded:: 0.29.0
+            Added the *where* parameter.
         """
         tabname = utils._quote_ident(table_name)
         if schema_name:
@@ -922,6 +966,7 @@ class Connection(metaclass=ConnectionMeta):
         else:
             cols = ''
 
+        cond = self._format_copy_where(where)
         opts = self._format_copy_opts(
             format=format, oids=oids, freeze=freeze, delimiter=delimiter,
             null=null, header=header, quote=quote, escape=escape,
@@ -929,14 +974,14 @@ class Connection(metaclass=ConnectionMeta):
             encoding=encoding
         )
 
-        copy_stmt = 'COPY {tab}{cols} FROM STDIN {opts}'.format(
-            tab=tabname, cols=cols, opts=opts)
+        copy_stmt = 'COPY {tab}{cols} FROM STDIN {opts} {cond}'.format(
+            tab=tabname, cols=cols, opts=opts, cond=cond)
 
         return await self._copy_in(copy_stmt, source, timeout)
 
     async def copy_records_to_table(self, table_name, *, records,
                                     columns=None, schema_name=None,
-                                    timeout=None):
+                                    timeout=None, where=None):
         """Copy a list of records to the specified table using binary COPY.
 
         :param str table_name:
@@ -952,6 +997,16 @@ class Connection(metaclass=ConnectionMeta):
 
         :param str schema_name:
             An optional schema name to qualify the table.
+
+        :param str where:
+            An optional SQL expression used to filter rows when copying.
+
+            .. note::
+
+                Usage of this parameter requires support for the
+                ``COPY FROM ... WHERE`` syntax, introduced in
+                PostgreSQL version 12.
+
 
         :param float timeout:
             Optional timeout value in seconds.
@@ -997,6 +1052,9 @@ class Connection(metaclass=ConnectionMeta):
 
         .. versionchanged:: 0.24.0
             The ``records`` argument may be an asynchronous iterable.
+
+        .. versionadded:: 0.29.0
+            Added the *where* parameter.
         """
         tabname = utils._quote_ident(table_name)
         if schema_name:
@@ -1014,13 +1072,26 @@ class Connection(metaclass=ConnectionMeta):
 
         intro_ps = await self._prepare(intro_query, use_cache=True)
 
+        cond = self._format_copy_where(where)
         opts = '(FORMAT binary)'
 
-        copy_stmt = 'COPY {tab}{cols} FROM STDIN {opts}'.format(
-            tab=tabname, cols=cols, opts=opts)
+        copy_stmt = 'COPY {tab}{cols} FROM STDIN {opts} {cond}'.format(
+            tab=tabname, cols=cols, opts=opts, cond=cond)
 
         return await self._protocol.copy_in(
             copy_stmt, None, None, records, intro_ps._state, timeout)
+
+    def _format_copy_where(self, where):
+        if where and not self._server_caps.sql_copy_from_where:
+            raise exceptions.UnsupportedServerFeatureError(
+                'the `where` parameter requires PostgreSQL 12 or later')
+
+        if where:
+            where_clause = 'WHERE ' + where
+        else:
+            where_clause = ''
+
+        return where_clause
 
     def _format_copy_opts(self, *, format=None, oids=None, freeze=None,
                           delimiter=None, null=None, header=None, quote=None,
@@ -1447,6 +1518,7 @@ class Connection(metaclass=ConnectionMeta):
         self._mark_stmts_as_closed()
         self._listeners.clear()
         self._log_listeners.clear()
+        self._query_loggers.clear()
         self._clean_tasks()
 
     def _clean_tasks(self):
@@ -1730,6 +1802,63 @@ class Connection(metaclass=ConnectionMeta):
             )
         return result
 
+    @contextlib.contextmanager
+    def query_logger(self, callback):
+        """Context manager that adds `callback` to the list of query loggers,
+        and removes it upon exit.
+
+        :param callable callback:
+            A callable or a coroutine function receiving one argument:
+            **record**: a LoggedQuery containing `query`, `args`, `timeout`,
+                        `elapsed`, `exception`, `conn_addr`, and
+                        `conn_params`.
+
+        Example:
+
+        .. code-block:: pycon
+
+            >>> class QuerySaver:
+                    def __init__(self):
+                        self.queries = []
+                    def __call__(self, record):
+                        self.queries.append(record.query)
+            >>> with con.query_logger(QuerySaver()):
+            >>>     await con.execute("SELECT 1")
+            >>> print(log.queries)
+            ['SELECT 1']
+
+        .. versionadded:: 0.29.0
+        """
+        self.add_query_logger(callback)
+        yield
+        self.remove_query_logger(callback)
+
+    @contextlib.contextmanager
+    def _time_and_log(self, query, args, timeout):
+        start = time.monotonic()
+        exception = None
+        try:
+            yield
+        except BaseException as ex:
+            exception = ex
+            raise
+        finally:
+            elapsed = time.monotonic() - start
+            record = LoggedQuery(
+                query=query,
+                args=args,
+                timeout=timeout,
+                elapsed=elapsed,
+                exception=exception,
+                conn_addr=self._addr,
+                conn_params=self._params,
+            )
+            for cb in self._query_loggers:
+                if cb.is_async:
+                    self._loop.create_task(cb.cb(record))
+                else:
+                    self._loop.call_soon(cb.cb, record)
+
     async def __execute(
         self,
         query,
@@ -1750,13 +1879,24 @@ class Connection(metaclass=ConnectionMeta):
             timeout=timeout,
         )
         timeout = self._protocol._get_timeout(timeout)
-        return await self._do_execute(
-            query,
-            executor,
-            timeout,
-            record_class=record_class,
-            ignore_custom_codec=ignore_custom_codec,
-        )
+        if self._query_loggers:
+            with self._time_and_log(query, args, timeout):
+                result, stmt = await self._do_execute(
+                    query,
+                    executor,
+                    timeout,
+                    record_class=record_class,
+                    ignore_custom_codec=ignore_custom_codec,
+                )
+        else:
+            result, stmt = await self._do_execute(
+                query,
+                executor,
+                timeout,
+                record_class=record_class,
+                ignore_custom_codec=ignore_custom_codec,
+            )
+        return result, stmt
 
     async def _executemany(self, query, args, timeout):
         executor = lambda stmt, timeout: self._protocol.bind_execute_many(
@@ -1767,7 +1907,8 @@ class Connection(metaclass=ConnectionMeta):
         )
         timeout = self._protocol._get_timeout(timeout)
         with self._stmt_exclusive_section:
-            result, _ = await self._do_execute(query, executor, timeout)
+            with self._time_and_log(query, args, timeout):
+                result, _ = await self._do_execute(query, executor, timeout)
         return result
 
     async def _do_execute(
@@ -2040,7 +2181,7 @@ async def connect(dsn=None, *,
             ...     )
             ...     con = await asyncpg.connect(user='postgres', ssl=sslctx)
             ...     await con.close()
-            >>> asyncio.run(run())
+            >>> asyncio.run(main())
 
         Example of programmatic SSL context configuration that is equivalent
         to ``sslmode=require`` (no server certificate or host verification):
@@ -2057,7 +2198,7 @@ async def connect(dsn=None, *,
             ...     sslctx.verify_mode = ssl.CERT_NONE
             ...     con = await asyncpg.connect(user='postgres', ssl=sslctx)
             ...     await con.close()
-            >>> asyncio.run(run())
+            >>> asyncio.run(main())
 
     :param bool direct_tls:
         Pass ``True`` to skip PostgreSQL STARTTLS mode and perform a direct
@@ -2184,27 +2325,27 @@ async def connect(dsn=None, *,
     if loop is None:
         loop = asyncio.get_event_loop()
 
-    return await connect_utils._connect(
-        loop=loop,
-        timeout=timeout,
-        connection_class=connection_class,
-        record_class=record_class,
-        dsn=dsn,
-        host=host,
-        port=port,
-        user=user,
-        password=password,
-        passfile=passfile,
-        ssl=ssl,
-        direct_tls=direct_tls,
-        database=database,
-        server_settings=server_settings,
-        command_timeout=command_timeout,
-        statement_cache_size=statement_cache_size,
-        max_cached_statement_lifetime=max_cached_statement_lifetime,
-        max_cacheable_statement_size=max_cacheable_statement_size,
-        target_session_attrs=target_session_attrs
-    )
+    async with compat.timeout(timeout):
+        return await connect_utils._connect(
+            loop=loop,
+            connection_class=connection_class,
+            record_class=record_class,
+            dsn=dsn,
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            passfile=passfile,
+            ssl=ssl,
+            direct_tls=direct_tls,
+            database=database,
+            server_settings=server_settings,
+            command_timeout=command_timeout,
+            statement_cache_size=statement_cache_size,
+            max_cached_statement_lifetime=max_cached_statement_lifetime,
+            max_cacheable_statement_size=max_cacheable_statement_size,
+            target_session_attrs=target_session_attrs
+        )
 
 
 class _StatementCacheEntry:
@@ -2400,10 +2541,17 @@ class _ConnectionProxy:
     __slots__ = ()
 
 
+LoggedQuery = collections.namedtuple(
+    'LoggedQuery',
+    ['query', 'args', 'timeout', 'elapsed', 'exception', 'conn_addr',
+     'conn_params'])
+LoggedQuery.__doc__ = 'Log record of an executed query.'
+
+
 ServerCapabilities = collections.namedtuple(
     'ServerCapabilities',
     ['advisory_locks', 'notifications', 'plpgsql', 'sql_reset',
-     'sql_close_all', 'jit'])
+     'sql_close_all', 'sql_copy_from_where', 'jit'])
 ServerCapabilities.__doc__ = 'PostgreSQL server capabilities.'
 
 
@@ -2416,6 +2564,7 @@ def _detect_server_capabilities(server_version, connection_settings):
         sql_reset = True
         sql_close_all = False
         jit = False
+        sql_copy_from_where = False
     elif hasattr(connection_settings, 'crdb_version'):
         # CockroachDB detected.
         advisory_locks = False
@@ -2424,6 +2573,7 @@ def _detect_server_capabilities(server_version, connection_settings):
         sql_reset = False
         sql_close_all = False
         jit = False
+        sql_copy_from_where = False
     elif hasattr(connection_settings, 'crate_version'):
         # CrateDB detected.
         advisory_locks = False
@@ -2432,6 +2582,7 @@ def _detect_server_capabilities(server_version, connection_settings):
         sql_reset = False
         sql_close_all = False
         jit = False
+        sql_copy_from_where = False
     else:
         # Standard PostgreSQL server assumed.
         advisory_locks = True
@@ -2440,6 +2591,7 @@ def _detect_server_capabilities(server_version, connection_settings):
         sql_reset = True
         sql_close_all = True
         jit = server_version >= (11, 0)
+        sql_copy_from_where = server_version.major >= 12
 
     return ServerCapabilities(
         advisory_locks=advisory_locks,
@@ -2447,6 +2599,7 @@ def _detect_server_capabilities(server_version, connection_settings):
         plpgsql=plpgsql,
         sql_reset=sql_reset,
         sql_close_all=sql_close_all,
+        sql_copy_from_where=sql_copy_from_where,
         jit=jit,
     )
 
