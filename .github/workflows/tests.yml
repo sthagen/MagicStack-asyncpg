@@ -17,7 +17,7 @@ jobs:
     # job.
     strategy:
       matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
         os: [ubuntu-latest, macos-latest, windows-latest]
         loop: [asyncio, uvloop]
         exclude:
@@ -27,6 +27,8 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
+    permissions: {}
+
     defaults:
       run:
         shell: bash
@@ -35,10 +37,11 @@ jobs:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
       with:
         fetch-depth: 50
         submodules: true
+        persist-credentials: false
 
     - name: Check if release PR.
       uses: edgedb/action-release/validate-pr@master
@@ -56,7 +59,7 @@ jobs:
         brew install postgresql
 
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       if: "!steps.release.outputs.is_release"
       with:
         python-version: ${{ matrix.python-version }}
@@ -66,7 +69,8 @@ jobs:
       run: |
         [ "$RUNNER_OS" = "Linux" ] && .github/workflows/install-krb5.sh
         python -m pip install -U pip setuptools wheel
-        python -m pip install -e .[test]
+        python -m pip install --group test
+        python -m pip install -e .
 
     - name: Test
       if: "!steps.release.outputs.is_release"
@@ -86,14 +90,17 @@ jobs:
 
     runs-on: ubuntu-latest
 
+    permissions: {}
+
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
       with:
         fetch-depth: 50
         submodules: true
+        persist-credentials: false
 
     - name: Check if release PR.
       uses: edgedb/action-release/validate-pr@master
@@ -117,7 +124,7 @@ jobs:
           >> "${GITHUB_ENV}"
 
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       if: "!steps.release.outputs.is_release"
       with:
         python-version: "3.x"
@@ -127,7 +134,8 @@ jobs:
       run: |
         [ "$RUNNER_OS" = "Linux" ] && .github/workflows/install-krb5.sh
         python -m pip install -U pip setuptools wheel
-        python -m pip install -e .[test]
+        python -m pip install --group test
+        python -m pip install -e .
 
     - name: Test
       if: "!steps.release.outputs.is_release"
@@ -142,6 +150,7 @@ jobs:
     name: "Regression Tests"
     needs: [test-platforms, test-postgres]
     runs-on: ubuntu-latest
+    permissions: {}
 
     steps:
       - run: echo OK
