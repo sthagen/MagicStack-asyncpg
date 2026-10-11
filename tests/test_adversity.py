@@ -20,6 +20,28 @@ from asyncpg import _testbase as tb
     'not compatible with ProactorEventLoop which is default in Python 3.8+')
 class TestConnectionLoss(tb.ProxiedClusterTestCase):
     @tb.with_timeout(30.0)
+    async def test_cancel_request_times_out_during_network_loss(self):
+        con = await self.connect(command_timeout=0.2)
+        try:
+            self.proxy.trigger_connectivity_loss()
+            loss_started = asyncio.run_coroutine_threadsafe(
+                self.proxy.connectivity_loss.wait(), self.proxy.loop)
+            await asyncio.wait_for(asyncio.wrap_future(loss_started), 1)
+
+            with self.assertRaises(asyncio.TimeoutError):
+                await con.execute('SELECT 1')
+            self.assertTrue(con._cancellations)
+
+            async def wait_until_closed():
+                while not con.is_closed():
+                    await asyncio.sleep(0.005)
+
+            await asyncio.wait_for(wait_until_closed(), 1)
+        finally:
+            self.proxy.restore_connectivity()
+            con.terminate()
+
+    @tb.with_timeout(30.0)
     async def test_connection_close_timeout(self):
         con = await self.connect()
         self.proxy.trigger_connectivity_loss()
@@ -29,7 +51,7 @@ class TestConnectionLoss(tb.ProxiedClusterTestCase):
     @tb.with_timeout(30.0)
     async def test_pool_acquire_timeout(self):
         pool = await self.create_pool(
-            database='postgres', min_size=2, max_size=2)
+            database='postgres', init_size=2, min_size=0, max_size=2)
         try:
             self.proxy.trigger_connectivity_loss()
             for _ in range(2):
@@ -46,7 +68,7 @@ class TestConnectionLoss(tb.ProxiedClusterTestCase):
     @tb.with_timeout(30.0)
     async def test_pool_release_timeout(self):
         pool = await self.create_pool(
-            database='postgres', min_size=2, max_size=2)
+            database='postgres', init_size=2, min_size=0, max_size=2)
         try:
             with self.assertRaises(asyncio.TimeoutError):
                 async with pool.acquire(timeout=0.5):
@@ -74,7 +96,8 @@ class TestConnectionLoss(tb.ProxiedClusterTestCase):
             self.proxy.trigger_connectivity_loss()
 
         new_pool = self.create_pool(
-            database='postgres', min_size=pool_size, max_size=pool_size,
+            database='postgres',
+            init_size=pool_size, min_size=0, max_size=pool_size,
             timeout=cmd_timeout, command_timeout=cmd_timeout)
 
         with self.assertRunUnder(worst_runtime):

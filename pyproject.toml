@@ -47,7 +47,7 @@ test = [
     'flake8~=6.1',
     'flake8-pyi~=24.1.0',
     'distro~=1.9.0',
-    'uvloop>=0.22.1; platform_system != "Windows" and python_version < "3.15.0"',
+    'uvloop>=0.23.0; platform_system != "Windows"',
     'gssapi; platform_system == "Linux"',
     'k5test; platform_system == "Linux"',
     'sspilib; platform_system == "Windows"',
@@ -63,7 +63,7 @@ docs = [
 requires = [
     "setuptools>=77.0.3",
     "packaging>=24.0",
-    "Cython(>=3.2.1,<4.0.0)"
+    "Cython>=3.2.1,<4.0.0"
 ]
 build-backend = "setuptools.build_meta"
 
@@ -84,6 +84,7 @@ skip = "cp38-*"
 [tool.cibuildwheel.macos]
 before-all = ".github/workflows/install-postgres.sh"
 test-command = "python {project}/tests/__init__.py"
+environment = {MACOSX_DEPLOYMENT_TARGET="11"}
 
 [tool.cibuildwheel.windows]
 test-command = "python {project}\\tests\\__init__.py"

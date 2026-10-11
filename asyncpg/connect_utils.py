@@ -35,6 +35,9 @@ from . import protocol
 
 _SSL_REQUEST_CODE = 80877103
 
+# Required by PostgreSQL 17+ for direct TLS connections.
+_ALPN_PROTOCOLS = ['postgresql']
+
 
 class SSLMode(enum.IntEnum):
     disable = 0
@@ -811,8 +814,13 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
                     ssl_max_protocol_version
                 )
 
+            if ssl_module.HAS_ALPN:
+                ssl.set_alpn_protocols(_ALPN_PROTOCOLS)
+
     elif ssl is True:
         ssl = ssl_module.create_default_context()
+        if ssl_module.HAS_ALPN:
+            ssl.set_alpn_protocols(_ALPN_PROTOCOLS)
         sslmode = SSLMode.verify_full
     elif isinstance(ssl, ssl_module.SSLContext):
         sslmode = SSLMode.require
@@ -1150,7 +1158,16 @@ async def __connect_addr(
     else:
         connector = loop.create_connection(proto_factory, *addr)
 
-    tr, pr = await connector
+    try:
+        tr, pr = await connector
+    except (Exception, asyncio.CancelledError):
+        # The protocol can exist before create_connection() returns.  If
+        # that operation is cancelled, nobody will await authentication.
+        if not connected.done():
+            connected.cancel()
+        elif not connected.cancelled():
+            connected.exception()
+        raise
 
     try:
         await connected
@@ -1278,15 +1295,11 @@ async def _connect(*, loop, connection_class, record_class, **kwargs):
             if target_attr == SessionAttribute.prefer_standby and candidates:
                 chosen_connection = random.choice(candidates)
     finally:
-
-        async def _close_candidates(conns, chosen):
-            await asyncio.gather(
-                *(c.close() for c in conns if c is not chosen),
-                return_exceptions=True
-            )
-        if candidates:
-            asyncio.create_task(
-                _close_candidates(candidates, chosen_connection))
+        # Do not wait for rejected hosts to disconnect: their cleanup must
+        # neither delay a successful connection nor outlive the event loop.
+        for c in candidates:
+            if c is not chosen_connection:
+                c.terminate()
 
     if chosen_connection:
         return chosen_connection
@@ -1310,29 +1323,31 @@ async def _cancel(*, loop, addr, params: _ConnectionParameters,
             if not self.on_disconnect.done():
                 self.on_disconnect.set_result(True)
 
-    if isinstance(addr, str):
-        tr, pr = await loop.create_unix_connection(CancelProto, addr)
-    else:
-        if params.ssl and params.sslmode != SSLMode.allow:
-            tr, pr = await _create_ssl_connection(
-                CancelProto,
-                *addr,
-                loop=loop,
-                ssl_context=params.ssl,
-                ssl_is_advisory=params.sslmode == SSLMode.prefer)
-        else:
-            tr, pr = await loop.create_connection(
-                CancelProto, *addr)
-            _set_nodelay(_get_socket(tr))
-
-    # Pack a CancelRequest message
-    msg = struct.pack('!llll', 16, 80877102, backend_pid, backend_secret)
-
+    tr = None
     try:
+        if isinstance(addr, str):
+            tr, pr = await loop.create_unix_connection(CancelProto, addr)
+        else:
+            if params.ssl and params.sslmode != SSLMode.allow:
+                tr, pr = await _create_ssl_connection(
+                    CancelProto,
+                    *addr,
+                    loop=loop,
+                    ssl_context=params.ssl,
+                    ssl_is_advisory=params.sslmode == SSLMode.prefer)
+            else:
+                tr, pr = await loop.create_connection(
+                    CancelProto, *addr)
+                _set_nodelay(_get_socket(tr))
+
+        # Pack a CancelRequest message
+        msg = struct.pack('!llll', 16, 80877102, backend_pid, backend_secret)
+
         tr.write(msg)
         await pr.on_disconnect
     finally:
-        tr.close()
+        if tr is not None:
+            tr.close()
 
 
 def _get_socket(transport):

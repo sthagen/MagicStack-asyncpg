@@ -54,6 +54,7 @@ class Connection(metaclass=ConnectionMeta):
                  '_intro_query', '_reset_query', '_proxy',
                  '_stmt_exclusive_section', '_config', '_params', '_addr',
                  '_log_listeners', '_termination_listeners', '_cancellations',
+                 '_pool_holder',
                  '_source_traceback', '_query_loggers', '__weakref__')
 
     def __init__(self, protocol, transport, loop,
@@ -105,6 +106,7 @@ class Connection(metaclass=ConnectionMeta):
 
         self._reset_query = None
         self._proxy = None
+        self._pool_holder = None
 
         # Used to serialize operations that might involve anonymous
         # statements.  Specifically, we want to make the following
@@ -134,6 +136,10 @@ class Connection(metaclass=ConnectionMeta):
 
             warnings.warn(msg, ResourceWarning)
             if not self._loop.is_closed():
+                # A weak holder reference may still be live during GC.
+                # Finalization must not notify the pool and restart
+                # maintenance.
+                self._pool_holder = None
                 self.terminate()
 
     async def add_listener(self, channel, callback):
@@ -175,7 +181,7 @@ class Connection(metaclass=ConnectionMeta):
     def add_log_listener(self, callback):
         """Add a listener for Postgres log messages.
 
-        It will be called when asyncronous NoticeResponse is received
+        It will be called when asynchronous NoticeResponse is received
         from the connection.  Possible message types are: WARNING, NOTICE,
         DEBUG, INFO, or LOG.
 
@@ -340,6 +346,23 @@ class Connection(metaclass=ConnectionMeta):
         :param args: Query arguments.
         :param float timeout: Optional timeout value in seconds.
         :return str: Status of the last SQL command.
+
+        When query arguments are provided, the command is executed as a
+        prepared statement and is eligible for the connection's LRU
+        statement cache.
+
+        The status string for an ``INSERT`` has the form
+        ``INSERT <oid> <count>``.  A result such as ``INSERT 0 0`` is a
+        legitimate outcome for queries that insert zero rows (for example,
+        ``INSERT ... SELECT ... WHERE false``), and does not indicate a
+        failure.  To confirm that a single row was inserted, check the
+        status string:
+
+        .. code-block:: pycon
+
+            >>> result = await con.execute(
+            ...     'INSERT INTO mytab (a) VALUES ($1)', 1)
+            >>> assert result == 'INSERT 0 1'
 
         .. versionchanged:: 0.5.4
            Made it possible to pass query arguments.
@@ -1116,7 +1139,7 @@ class Connection(metaclass=ConnectionMeta):
         intro_query = 'SELECT {cols} FROM {tab} LIMIT 1'.format(
             tab=tabname, cols=col_list)
 
-        intro_ps = await self.prepare(intro_query)
+        intro_ps = await self._prepare(intro_query, use_cache=True)
 
         cond = self._format_copy_where(where)
         opts = '(FORMAT binary)'
@@ -1520,7 +1543,7 @@ class Connection(metaclass=ConnectionMeta):
 
     def terminate(self):
         """Terminate the connection without waiting for pending data."""
-        if not self.is_closed():
+        if not self._aborted and self._protocol is not None:
             self._abort()
         self._cleanup()
 
@@ -1573,18 +1596,20 @@ class Connection(metaclass=ConnectionMeta):
     def _abort(self):
         # Put the connection into the aborted state.
         self._aborted = True
-        self._protocol.abort()
-        self._protocol = None
+        if self._protocol is not None:
+            self._protocol.abort()
+            self._protocol = None
 
     def _cleanup(self):
         self._call_termination_listeners()
         # Free the resources associated with this connection.
         # This must be called when a connection is terminated.
 
-        if self._proxy is not None:
-            # Connection is a member of a pool, so let the pool
-            # know that this connection is dead.
-            self._proxy._holder._release_on_close()
+        if self._pool_holder is not None:
+            # Idle connections have no proxy, but still belong to a holder.
+            holder, self._pool_holder = self._pool_holder(), None
+            if holder is not None and holder._con is self:
+                holder._release_on_close()
 
         self._mark_stmts_as_closed()
         self._listeners.clear()
@@ -1595,8 +1620,9 @@ class Connection(metaclass=ConnectionMeta):
     def _clean_tasks(self):
         # Wrap-up any remaining tasks associated with this connection.
         if self._cancellations:
+            current = asyncio.current_task(self._loop)
             for fut in self._cancellations:
-                if not fut.done():
+                if fut is not current and not fut.done():
                     fut.cancel()
             self._cancellations.clear()
 
@@ -1649,37 +1675,42 @@ class Connection(metaclass=ConnectionMeta):
             # so we ignore the timeout.
             await self._protocol.close_statement(stmt, protocol.NO_TIMEOUT)
 
-    async def _cancel(self, waiter):
+    async def _cancel(self, waiter, cancel_waiter=None):
         try:
-            # Open new connection to the server
-            await connect_utils._cancel(
-                loop=self._loop, addr=self._addr, params=self._params,
-                backend_pid=self._protocol.backend_pid,
-                backend_secret=self._protocol.backend_secret)
-        except ConnectionResetError as ex:
-            # On some systems Postgres will reset the connection
-            # after processing the cancellation command.
-            if not waiter.done():
-                waiter.set_exception(ex)
+            async with compat.timeout(self._config.command_timeout):
+                try:
+                    await connect_utils._cancel(
+                        loop=self._loop, addr=self._addr, params=self._params,
+                        backend_pid=self._protocol.backend_pid,
+                        backend_secret=self._protocol.backend_secret)
+                except ConnectionResetError:
+                    # Some servers reset the auxiliary connection after
+                    # receiving the CancelRequest.  The original connection
+                    # still has to acknowledge the cancelled query.
+                    pass
+
+                if not waiter.done():
+                    waiter.set_result(None)
+                if cancel_waiter is not None:
+                    await asyncio.shield(cancel_waiter)
         except asyncio.CancelledError:
-            # There are two scenarios in which the cancellation
-            # itself will be cancelled: 1) the connection is being closed,
-            # 2) the event loop is being shut down.
-            # In either case we do not care about the propagation of
-            # the CancelledError, and don't want the loop to warn about
-            # an unretrieved exception.
+            # Teardown can cancel this background task.  Its waiters are
+            # completed in finally, without leaking CancelledError.
             pass
-        except (Exception, asyncio.CancelledError) as ex:
-            if not waiter.done():
-                waiter.set_exception(ex)
+        except Exception:
+            if not self._aborted:
+                # A failed CancelRequest leaves the original connection's
+                # protocol state uncertain.  It cannot be reused safely.
+                self.terminate()
         finally:
             self._cancellations.discard(
                 asyncio.current_task(self._loop))
             if not waiter.done():
                 waiter.set_result(None)
 
-    def _cancel_current_command(self, waiter):
-        self._cancellations.add(self._loop.create_task(self._cancel(waiter)))
+    def _cancel_current_command(self, waiter, cancel_waiter=None):
+        self._cancellations.add(self._loop.create_task(
+            self._cancel(waiter, cancel_waiter)))
 
     def _process_log_message(self, fields, last_query):
         if not self._log_listeners:
@@ -1908,8 +1939,10 @@ class Connection(metaclass=ConnectionMeta):
         .. versionadded:: 0.29.0
         """
         self.add_query_logger(callback)
-        yield
-        self.remove_query_logger(callback)
+        try:
+            yield
+        finally:
+            self.remove_query_logger(callback)
 
     @contextlib.contextmanager
     def _time_and_log(self, query, args, timeout):
@@ -2147,7 +2180,7 @@ async def connect(dsn=None, *,
         - host address(es) parsed from the *dsn* argument,
         - the value of the ``PGHOST`` environment variable,
         - on Unix, common directories used for PostgreSQL Unix-domain
-          sockets: ``"/run/postgresql"``, ``"/var/run/postgresl"``,
+          sockets: ``"/run/postgresql"``, ``"/var/run/postgresql"``,
           ``"/var/pgsql_socket"``, ``"/private/tmp"``, and ``"/tmp"``,
         - ``"localhost"``.
 
@@ -2199,7 +2232,7 @@ async def connect(dsn=None, *,
         connection service file.
 
     :param servicefile:
-        The location of the connnection service file used to store
+        The location of the connection service file used to store
         connection parameters.
 
     :param loop:
@@ -2313,6 +2346,10 @@ async def connect(dsn=None, *,
         Pass ``True`` to skip PostgreSQL STARTTLS mode and perform a direct
         SSL connection. Requires ``ssl='require'``, ``'verify-ca'``,
         ``'verify-full'``, ``True``, or an explicit ``SSLContext``.
+        PostgreSQL 17+ requires the ``postgresql`` ALPN protocol for direct
+        SSL connections: asyncpg sets it on the contexts it creates, but an
+        explicit ``SSLContext`` must set it with
+        ``ctx.set_alpn_protocols(['postgresql'])``.
 
     :param dict server_settings:
         An optional dict of server runtime parameters.  Refer to
@@ -2432,6 +2469,8 @@ async def connect(dsn=None, *,
        ``ssl=True``, or an explicit ``SSLContext``. Other values
        (``'disable'``, ``'allow'``, and ``'prefer'``) will raise a
        ``ClientConfigurationError``.
+       SSL contexts created by asyncpg now set the ``postgresql`` ALPN
+       protocol, which PostgreSQL 17+ requires for direct SSL connections.
 
     .. _SSLContext: https://docs.python.org/3/library/ssl.html#ssl.SSLContext
     .. _create_default_context:

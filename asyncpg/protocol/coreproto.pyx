@@ -637,7 +637,7 @@ cdef class CoreProtocol:
                 self.result_type = RESULT_FAILED
                 self.result = apg_exc.InterfaceError(
                     'could not verify server signature for '
-                    'SCRAM authentciation: scram-sha-256',
+                    'SCRAM authentication: scram-sha-256',
                 )
             self.scram = None
 
@@ -675,7 +675,7 @@ cdef class CoreProtocol:
             WriteBuffer msg
 
         msg = WriteBuffer.new_message(b'p')
-        msg.write_bytestring(self.password.encode(self.encoding))
+        msg.write_bytestring((self.password or '').encode(self.encoding))
         msg.end_message()
 
         return msg
@@ -700,7 +700,7 @@ cdef class CoreProtocol:
         cdef:
             WriteBuffer msg
 
-        # use the first supported advertized mechanism
+        # use the first supported advertised mechanism
         self.scram = SCRAMAuthentication(sasl_auth_methods[0])
         # this involves a call and response with the server
         msg = WriteBuffer.new_message(b'p')

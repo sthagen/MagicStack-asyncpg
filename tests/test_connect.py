@@ -270,6 +270,11 @@ class TestAuthentication(BaseTestAuthentication):
                 user='password_user',
                 password='wrongpassword')
 
+    async def test_auth_password_cleartext_without_password(self):
+        with self.assertRaises(asyncpg.InvalidPasswordError):
+            await self._try_connect(
+                user='password_user', password=lambda: None)
+
     async def test_auth_password_cleartext_callable(self):
         def get_correctpassword():
             return CORRECT_PASSWORD
@@ -1664,7 +1669,118 @@ gsslib=sspi
                 await asyncpg.connect(**{arg: val})
 
 
+class TestConnectionCleanup(tb.TestCase):
+
+    async def test_connect_terminates_rejected_connections(self):
+        for outcome in ('matched', 'unmatched', 'error', 'cancelled'):
+            with self.subTest(outcome=outcome):
+                rejected = unittest.mock.Mock(spec=pg_connection.Connection)
+                candidate = unittest.mock.Mock(spec=pg_connection.Connection)
+                results = {
+                    'matched': True,
+                    'unmatched': False,
+                    'error': RuntimeError('attribute check failed'),
+                    'cancelled': asyncio.CancelledError(),
+                }
+                tasks_before = asyncio.all_tasks()
+                try:
+                    with unittest.mock.patch.object(
+                            connect_utils, '_connect_addr',
+                            side_effect=[rejected, candidate],
+                    ), unittest.mock.patch.object(
+                            connect_utils, '_can_use_connection',
+                            side_effect=[False, results[outcome]],
+                    ):
+                        coro = asyncpg.connect(
+                            host=['first', 'second'], user='postgres',
+                            database='postgres', ssl=False,
+                            target_session_attrs='primary',
+                        )
+                        if outcome == 'matched':
+                            self.assertIs(await coro, candidate)
+                        else:
+                            expected = {
+                                'unmatched':
+                                    exceptions.TargetServerAttributeNotMatched,
+                                'error': RuntimeError,
+                                'cancelled': asyncio.CancelledError,
+                            }[outcome]
+                            with self.assertRaises(expected):
+                                await coro
+
+                    rejected.terminate.assert_called_once_with()
+                    rejected.close.assert_not_called()
+                    candidate.close.assert_not_called()
+                    if outcome == 'matched':
+                        candidate.terminate.assert_not_called()
+                    else:
+                        candidate.terminate.assert_called_once_with()
+                    self.assertEqual(asyncio.all_tasks(), tasks_before)
+                finally:
+                    # Clean up unexpected tasks if a regression assertion
+                    # fails.
+                    pending = asyncio.all_tasks() - tasks_before
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+
+    async def test_rejected_host_cannot_time_out_selected_connection(self):
+        async def close():
+            await asyncio.Future()
+
+        rejected = unittest.mock.Mock(spec=pg_connection.Connection)
+        rejected.close.side_effect = close
+        selected = unittest.mock.Mock(spec=pg_connection.Connection)
+        tasks_before = asyncio.all_tasks()
+        try:
+            with unittest.mock.patch.object(
+                connect_utils, '_connect_addr',
+                side_effect=[rejected, selected],
+            ), unittest.mock.patch.object(
+                connect_utils, '_can_use_connection',
+                side_effect=[False, True],
+            ):
+                con = await asyncpg.connect(
+                    host=['first', 'second'], user='postgres',
+                    database='postgres', ssl=False,
+                    target_session_attrs='primary', timeout=0.1,
+                )
+            self.assertIs(con, selected)
+            rejected.terminate.assert_called_once_with()
+            rejected.close.assert_not_called()
+            selected.terminate.assert_not_called()
+            selected.close.assert_not_called()
+            self.assertEqual(asyncio.all_tasks(), tasks_before)
+        finally:
+            pending = asyncio.all_tasks() - tasks_before
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+
 class TestConnection(tb.ConnectedTestCase):
+
+    async def test_connection_cancelled_during_transport_setup(self):
+        for connection_lost_first in (False, True):
+            with self.subTest(connection_lost_first=connection_lost_first):
+                async def interrupted_connector(factory, *args, **kwargs):
+                    proto = factory()
+                    if connection_lost_first:
+                        proto.connection_lost(None)
+                    else:
+                        self.loop.call_soon(proto.connection_lost, None)
+                    raise asyncio.CancelledError
+
+                with unittest.mock.patch.object(
+                    self.loop, 'create_connection', interrupted_connector,
+                ):
+                    with self.assertRaises(asyncio.CancelledError):
+                        await self.connect(host='127.0.0.1', ssl=False)
+
+                # Authentication must not report an unobserved failure after
+                # cancellation, even if the transport closes afterwards.
+                await asyncio.sleep(0)
+                gc.collect()
 
     async def test_connection_isinstance(self):
         self.assertTrue(isinstance(self.con, pg_connection.Connection))
@@ -2326,6 +2442,20 @@ class TestSSLConnection(BaseTestSSLConnection):
         self.assertEqual(ctx.verify_mode, ssl.CERT_NONE)
         self.assertFalse(ctx.check_hostname)
 
+    async def test_direct_tls_native(self):
+        if self.cluster.get_pg_version() < (17, 0):
+            self.skipTest('native direct TLS requires PostgreSQL 17+')
+
+        for mode in ('require', 'verify-ca', 'verify-full', True):
+            with self.subTest(mode=mode):
+                with unittest.mock.patch.dict(os.environ, {
+                    'SSL_CERT_FILE': SSL_CA_CERT_FILE,
+                }):
+                    await self._test_works(
+                        dsn='postgresql://ssl_user@localhost/postgres'
+                            '?sslrootcert=' + SSL_CA_CERT_FILE,
+                        ssl=mode, direct_tls=True, expected_ssl=True)
+
     async def test_direct_tls_configuration_sources(self):
         base_dsn = 'postgresql://ssl_user@localhost/postgres'
 
@@ -2743,6 +2873,48 @@ class TestConnectionGC(tb.ClusterTestCase):
 
 
 class TestConnectionAttributes(tb.HotStandbyTestCase):
+
+    async def test_rejected_standby_is_terminated_before_primary(self):
+        primary_spec = self.get_cluster_connection_spec(self.master_cluster)
+        standby_spec = self.get_cluster_connection_spec(self.standby_cluster)
+        candidates = []
+        terminated = []
+
+        class Connection(pg_connection.Connection):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                if not candidates:
+                    self.add_termination_listener(terminated.append)
+                candidates.append(self)
+
+        con = None
+        try:
+            con = await self.connect(
+                host=[standby_spec['host'], primary_spec['host']],
+                port=[standby_spec['port'], primary_spec['port']],
+                connection_class=Connection, target_session_attrs='primary',
+                timeout=5,
+            )
+            self.assertEqual(len(candidates), 2)
+            rejected = candidates[0]
+            self.assertTrue(rejected.is_closed())
+            self.assertTrue(rejected._transport.is_closing())
+            self.assertIs(con, candidates[1])
+            self.assertFalse(con.is_closed())
+            self.assertTrue(_get_connected_host(con).endswith(
+                primary_spec['port']))
+            self.assertEqual(await con.fetchval('SELECT 42'), 42)
+            self.assertEqual(terminated, [rejected])
+
+            # A later graceful close of the terminated connection is safe.
+            await rejected.close()
+            self.assertEqual(await con.fetchval('SELECT 43'), 43)
+            self.assertEqual(terminated, [rejected])
+        finally:
+            for candidate in candidates:
+                candidate.terminate()
+            if con is not None:
+                await con.close()
 
     async def _run_connection_test(
         self, connect, target_attribute, expected_port

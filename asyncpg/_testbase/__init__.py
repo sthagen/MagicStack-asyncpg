@@ -101,9 +101,10 @@ class TestCase(unittest.TestCase, metaclass=TestCaseMeta):
     def setUpClass(cls):
         if os.environ.get('USE_UVLOOP'):
             import uvloop
-            asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+            loop = uvloop.new_event_loop()
+        else:
+            loop = asyncio.new_event_loop()
 
-        loop = asyncio.new_event_loop()
         asyncio.set_event_loop(None)
         cls.loop = loop
 
@@ -267,6 +268,7 @@ def _shutdown_cluster(cluster):
 
 
 def create_pool(dsn=None, *,
+                init_size=None,
                 min_size=10,
                 max_size=10,
                 max_queries=50000,
@@ -281,6 +283,7 @@ def create_pool(dsn=None, *,
                 **connect_kwargs):
     return pool_class(
         dsn,
+        init_size=init_size,
         min_size=min_size,
         max_size=max_size,
         max_queries=max_queries,
@@ -366,10 +369,16 @@ class ClusterTestCase(TestCase):
         self._pools = []
 
     def tearDown(self):
-        super().tearDown()
+        maintenance_tasks = []
         for pool in self._pools:
             pool.terminate()
+            if pool._maintenance_task is not None:
+                maintenance_tasks.append(pool._maintenance_task)
+        if maintenance_tasks:
+            self.loop.run_until_complete(asyncio.gather(
+                *maintenance_tasks, return_exceptions=True))
         self._pools = []
+        super().tearDown()
 
     def create_pool(self, pool_class=pg_pool.Pool,
                     connection_class=pg_connection.Connection, **kwargs):
